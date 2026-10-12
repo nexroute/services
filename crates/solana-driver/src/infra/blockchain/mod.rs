@@ -7,6 +7,22 @@
 mod accounts;
 mod token;
 
+use {
+    crate::domain::Slot,
+    cow_settlement_interface::token_program::TokenProgram,
+    cow_solana_rpc::{
+        Error,
+        LatestBlockhash,
+        RpcPrioritizationFee,
+        RpcSimulateBundleTransactionResult,
+        SolanaRPC,
+        UiTransactionError,
+    },
+    itertools::{Either, Itertools},
+    moka::sync::Cache,
+    solana_sdk::{pubkey::Pubkey, signature::Signature, transaction::VersionedTransaction},
+    std::collections::HashMap,
+};
 pub use {
     accounts::{
         AccountsSnapshot,
@@ -21,21 +37,31 @@ pub use {
         require_token_balance,
     },
 };
-use {
-    cow_settlement_interface::token_program::TokenProgram,
-    cow_solana_rpc::{Error, LatestBlockhash, SolanaRPC},
-    itertools::{Either, Itertools},
-    moka::sync::Cache,
-    solana_sdk::{pubkey::Pubkey, signature::Signature, transaction::VersionedTransaction},
-    std::collections::HashMap,
-};
 
 /// How many mints the token program cache holds.
 const TOKEN_PROGRAM_CACHE_CAPACITY: u64 = 10_000;
 
+/// A simulated transaction's outcome and the slot it ran against.
+pub struct TransactionSimulation {
+    pub slot: Slot,
+    pub err: Option<UiTransactionError>,
+    pub logs: Option<Vec<String>>,
+}
+
+/// A simulated bundle's per-transaction results, in order and ending at the
+/// first failure, and the slot it ran against.
+pub struct BundleSimulation {
+    pub slot: Slot,
+    pub results: Vec<RpcSimulateBundleTransactionResult>,
+}
+
 /// The Solana blockchain adapter.
 pub struct Solana {
     rpc: SolanaRPC,
+    /// Serves `simulateBundle`, which `rpc` need not support.
+    /// TODO: temporary; collapse into `rpc` once a single endpoint serves
+    /// every method, see `config::Rpc::bundle_endpoint`.
+    bundle_rpc: SolanaRPC,
     program_id: Pubkey,
     /// The token program of each mint looked up so far. Entries never expire:
     /// a mint's owner changes only if the mint is closed and re-created.
@@ -43,10 +69,10 @@ pub struct Solana {
 }
 
 impl Solana {
-    /// Build the adapter from the RPC client and the settlement program id.
-    pub fn new(rpc: SolanaRPC, program_id: Pubkey) -> Self {
+    pub fn new(rpc: SolanaRPC, bundle_rpc: SolanaRPC, program_id: Pubkey) -> Self {
         Self {
             rpc,
+            bundle_rpc,
             program_id,
             token_programs: Cache::new(TOKEN_PROGRAM_CACHE_CAPACITY),
         }
@@ -68,13 +94,38 @@ impl Solana {
         self.rpc.slot().await
     }
 
-    /// Simulate a signed transaction without sending it. Returns the
-    /// simulation result including logs and any error.
+    /// The prioritization fees recently paid by transactions locking
+    /// `addresses` as writable, one entry per recent slot.
+    pub async fn recent_prioritization_fees(
+        &self,
+        addresses: &[Pubkey],
+    ) -> Result<Vec<RpcPrioritizationFee>, Error> {
+        self.rpc.recent_prioritization_fees(addresses).await
+    }
+
+    /// Simulate a signed transaction without sending it.
     pub async fn simulate_transaction(
         &self,
         transaction: &VersionedTransaction,
-    ) -> Result<cow_solana_rpc::RpcSimulateTransactionResult, Error> {
-        self.rpc.simulate_transaction(transaction).await
+    ) -> Result<TransactionSimulation, Error> {
+        let response = self.rpc.simulate_transaction(transaction).await?;
+        Ok(TransactionSimulation {
+            slot: Slot(response.context.slot),
+            err: response.value.err,
+            logs: response.value.logs,
+        })
+    }
+
+    /// See [`SolanaRPC::simulate_bundle`].
+    pub async fn simulate_bundle(
+        &self,
+        transactions: &[VersionedTransaction],
+    ) -> Result<BundleSimulation, Error> {
+        let response = self.bundle_rpc.simulate_bundle(transactions).await?;
+        Ok(BundleSimulation {
+            slot: Slot(response.context.slot),
+            results: response.value,
+        })
     }
 
     /// Send a signed transaction and wait for confirmation.
@@ -146,7 +197,11 @@ mod tests {
             RpcRequest::GetMultipleAccounts,
             multiple_accounts_json([mint_account_json(), serde_json::Value::Null]),
         )]);
-        let solana = Solana::new(SolanaRPC::new_mock_with_mocks(mocks), Pubkey::new_unique());
+        let solana = Solana::new(
+            SolanaRPC::new_mock_with_mocks(mocks.clone()),
+            SolanaRPC::new_mock_with_mocks(mocks),
+            Pubkey::new_unique(),
+        );
 
         let expected = HashMap::from([
             (mint, Ok(TokenProgram::SplToken)),

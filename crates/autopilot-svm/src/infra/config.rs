@@ -6,6 +6,7 @@ use {
         deserialize_env::deserialize_string_from_env,
         shared::LoggingConfig,
     },
+    cow_settlement_interface::pda::state::STATE_PDA_SEEDS,
     serde::Deserialize,
     serde_ext::{deserialize_nonempty_vec, deserialize_solana_pubkey_b58},
     solana_sdk::pubkey::Pubkey,
@@ -183,6 +184,12 @@ pub struct Sponsoring {
     /// payer. Its pubkey must match the orderbook's `sponsoring.funder`, the
     /// fee payer pinned at placement.
     pub funder: cow_solana_signer::Config,
+    /// Most creations sent per auction for pending sponsored orders that
+    /// appear only in losing solutions, so the orders outlive their creation
+    /// blockhash. An owner gets at most one per auction. The funder pays for
+    /// each, and its order may never fill. Zero, the default, sends none.
+    #[serde(default)]
+    pub max_displaced_creations: usize,
 }
 
 /// On-chain addresses: programs and mints.
@@ -193,6 +200,26 @@ pub struct Contracts {
     /// in.
     #[serde(deserialize_with = "deserialize_solana_pubkey_b58")]
     pub wrapped_native_mint: Pubkey,
+    /// The settlement program whose state PDA sell token accounts must
+    /// approve. Defaults to the official deployment the interface crate
+    /// exports.
+    #[serde(
+        default = "default_settlement_program_id",
+        deserialize_with = "deserialize_solana_pubkey_b58"
+    )]
+    pub settlement_program_id: Pubkey,
+}
+
+impl Contracts {
+    /// The settlement state PDA: the delegate every sell token account must
+    /// approve.
+    pub fn state_pda(&self) -> Pubkey {
+        Pubkey::find_program_address(&STATE_PDA_SEEDS, &self.settlement_program_id).0
+    }
+}
+
+fn default_settlement_program_id() -> Pubkey {
+    cow_settlement_interface::ID
 }
 
 /// Competition parameters.
@@ -232,6 +259,18 @@ pub struct Driver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn contracts_default_to_the_interface_program_id() {
+        let contracts: Contracts = toml::de::from_str(
+            "wrapped-native-mint = \"So11111111111111111111111111111111111111112\"",
+        )
+        .unwrap();
+        assert_eq!(
+            contracts.settlement_program_id,
+            cow_settlement_interface::ID
+        );
+    }
 
     #[tokio::test]
     async fn loads_the_example_config() {

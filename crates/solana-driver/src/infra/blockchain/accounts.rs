@@ -40,6 +40,10 @@ impl AccountsSnapshot {
             .is_some_and(|feature| feature.activated_at.is_some())
     }
 
+    pub fn exists(&self, address: &Pubkey) -> bool {
+        self.accounts.contains_key(address)
+    }
+
     /// Return the address lookup table at `key` for the v0 message compiler.
     ///
     /// # Requirements

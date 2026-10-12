@@ -20,6 +20,7 @@ use {
     axum::{Json, http::StatusCode},
     bigdecimal::ToPrimitive,
     cow_settlement_interface::{
+        SettlementError,
         data::intent::{
             Asset,
             ENCODED_NATIVE_SOL_TRANSFER,
@@ -28,7 +29,7 @@ use {
             hash_bytes,
         },
         instruction::{InstructionInputParsing, create_order::CreateOrderInput},
-        pda::{order::find_order_pda, state::find_state_pda},
+        pda::{order::find_order_pda, state::STATE_PDA_SEEDS},
     },
     database::{byte_array::ByteArray, solana::OrderKind},
     serde::Deserialize,
@@ -68,7 +69,6 @@ enum PlacementError {
     InvalidTransaction(&'static str),
     WrongFeePayer,
     WrongRentPayer,
-    InvalidIntentFlags,
     WrongOrderPda,
     WrongDelegate,
     SameBuyAndSellToken,
@@ -95,10 +95,6 @@ impl From<PlacementError> for error::Reply {
             PlacementError::WrongRentPayer => (
                 "WrongRentPayer",
                 "the rent payer must be the configured funder account",
-            ),
-            PlacementError::InvalidIntentFlags => (
-                "InvalidIntentFlags",
-                "a sponsored order must be flagged created_on_chain",
             ),
             PlacementError::WrongOrderPda => {
                 ("WrongOrderPda", "the order PDA does not match the intent")
@@ -239,7 +235,7 @@ async fn place(
         None => None,
     };
 
-    let uid = order.uid;
+    let uid = const_hex::encode_prefixed(order.uid.0);
     if let Err(err) = db::insert_sponsored_order(state.pool(), &order, quote.as_ref()).await {
         let duplicate = err
             .downcast_ref::<sqlx::Error>()
@@ -250,7 +246,8 @@ async fn place(
         }
         return Err(Failure::internal(err, "sponsored order insert"));
     }
-    Ok((StatusCode::CREATED, Json(const_hex::encode_prefixed(uid.0))))
+    tracing::info!(order_uid = %uid, "order created");
+    Ok((StatusCode::CREATED, Json(uid)))
 }
 
 /// Check the transaction is exactly the sponsored-creation shape and derive
@@ -316,12 +313,14 @@ fn validate(
     if *input.created_by != sponsoring.funder {
         return Err(PlacementError::WrongRentPayer);
     }
-    let intent = OrderIntent::try_from(&input.intent_bytes)
-        .map_err(|_| PlacementError::InvalidTransaction("the intent bytes do not decode"))?;
+    let intent = OrderIntent::try_from(&input.intent_bytes).map_err(|err| {
+        if err == SettlementError::ZeroOrderAmount.into() {
+            PlacementError::ZeroAmount
+        } else {
+            PlacementError::InvalidTransaction("the intent bytes do not decode")
+        }
+    })?;
     let uid = hash_bytes(&input.intent_bytes);
-    if !intent.flags.created_on_chain {
-        return Err(PlacementError::InvalidIntentFlags);
-    }
     // The signature loop below skips the funder's slot, so a funder-owned
     // intent would be authorized by the countersign alone. The owner must
     // also sit among the required signers: the header is client-controlled,
@@ -343,9 +342,6 @@ fn validate(
     if intent.sell.mint == buy_mint {
         return Err(PlacementError::SameBuyAndSellToken);
     }
-    if intent.sell_amount == 0 || intent.buy_amount == 0 {
-        return Err(PlacementError::ZeroAmount);
-    }
     let native_buy = matches!(intent.buy, Asset::Native(_));
     let order_pda = find_order_pda(&sponsoring.settlement_program, &uid).0;
     if *input.order_pda != order_pda {
@@ -360,7 +356,8 @@ fn validate(
     // The preparation instructions may only follow the template: each step
     // at most once, in template order. The buy-account creation is mandatory
     // for a token buy, everything else is omittable.
-    let state_pda = find_state_pda(&sponsoring.settlement_program).0;
+    let state_pda =
+        Pubkey::find_program_address(&STATE_PDA_SEEDS, &sponsoring.settlement_program).0;
     let mut last_step = 0;
     let mut token_programs = Vec::new();
     for preparation in preparations {
@@ -806,8 +803,8 @@ fn build_order(
         buy_token: ByteArray(buy_mint.to_bytes()),
         sell_token_account: ByteArray(intent.sell.token_account.to_bytes()),
         buy_token_account: ByteArray(buy_token_account.to_bytes()),
-        sell_amount: intent.sell_amount,
-        buy_amount: intent.buy_amount,
+        sell_amount: intent.sell_amount.get(),
+        buy_amount: intent.buy_amount.get(),
         valid_to: intent.valid_to,
         kind: match intent.flags.kind {
             IntentOrderKind::Sell => OrderKind::Sell,

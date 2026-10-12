@@ -17,8 +17,8 @@ use {
         token_program::TokenProgram,
     },
     serde::Serialize,
-    solana_sdk::pubkey::Pubkey,
-    std::{fmt, sync::Arc},
+    solana_sdk::{pubkey::Pubkey, transaction::VersionedTransaction},
+    std::{collections::HashMap, fmt, sync::Arc},
 };
 
 /// The autopilot-assigned identifier of an auction.
@@ -72,8 +72,17 @@ pub struct Auction {
     pub deadline_slot: Slot,
     /// Absolute deadline by which solver engines must return solutions. The
     /// driver derives each request's timeout as the time left until this
-    /// instant. It skips the request if the deadline has passed.
+    /// instant. It skips the request if the deadline has passed. A solve
+    /// narrows the autopilot's deadline to the engine's share of it.
     pub deadline: chrono::DateTime<chrono::Utc>,
+    /// The owner-signed creation transaction of each order not created on
+    /// chain yet, by uid. It lacks the funder's signature, so it can only be
+    /// simulated ahead of a settlement, never sent.
+    pub creations: HashMap<OrderUid, VersionedTransaction>,
+    /// Lamports per 10^9 atoms of each auction token. A native SOL buy's
+    /// price sits under [`ENCODED_NATIVE_SOL_TRANSFER`]. Tokens without a
+    /// price are absent.
+    pub native_prices: HashMap<Pubkey, u64>,
 }
 
 impl Auction {
@@ -147,6 +156,34 @@ impl Auction {
         }
         Ok(resolved)
     }
+
+    /// Drop the creations whose order PDA already exists on chain: an earlier
+    /// settlement attempt landed them and the autopilot still ships them
+    /// until the indexer catches up. Simulating one fails on the existing
+    /// account and would veto a settlement that no longer needs it. A failed
+    /// lookup keeps every creation and leaves the verdict to the simulation.
+    pub(super) async fn drop_landed_creations(&mut self, blockchain: &Solana) {
+        if self.creations.is_empty() {
+            return;
+        }
+        let pdas = self
+            .orders
+            .iter()
+            .filter(|order| self.creations.contains_key(&order.uid))
+            .map(|order| order.order_pda);
+        let snapshot = match blockchain.accounts_snapshot(pdas).await {
+            Ok(snapshot) => snapshot,
+            Err(err) => {
+                tracing::warn!(?err, "could not check which creations already landed");
+                return;
+            }
+        };
+        for order in &self.orders {
+            if snapshot.exists(&order.order_pda) && self.creations.remove(&order.uid).is_some() {
+                tracing::info!(order_uid = %order.uid, "creation already landed, settling without it");
+            }
+        }
+    }
 }
 
 /// One order available for solvers to fill.
@@ -166,9 +203,79 @@ pub struct Order {
     pub partially_fillable: bool,
     pub order_pda: Pubkey,
     pub app_data: [u8; 32],
+    /// The cumulative fill on the order's own side: sell-token units for a
+    /// sell order, buy-token units for a buy order.
+    pub executed: u64,
+    /// What the owner's sell token account can fund, as the autopilot read
+    /// it at the cut. `None` when unknown: a pending sponsored order, a
+    /// quote, an autopilot that predates balance scaling.
+    pub sell_balance: Option<u64>,
 }
 
 impl Order {
+    /// The amounts still open to fill: the order-side target less `executed`,
+    /// the other leg scaled in proportion.
+    ///
+    /// TODO: duplicate of `autopilot-svm`'s `Order::remaining`; unify the two.
+    pub fn remaining(&self) -> Remaining {
+        let (target, _) = self.legs();
+        self.scaled(target.saturating_sub(self.executed))
+    }
+
+    /// What a solver may fill now: `remaining` scaled down to what the sell
+    /// token account can fund, like the EVM driver's `Order::available`. A
+    /// fill-or-kill order cannot shrink, so it keeps its remainder; the
+    /// autopilot drops it when the account cannot fund that.
+    pub fn available(&self) -> Remaining {
+        let remaining = self.remaining();
+        let Some(balance) = self.sell_balance else {
+            return remaining;
+        };
+        if !self.partially_fillable || balance >= remaining.sell {
+            return remaining;
+        }
+        let open = match self.side {
+            Side::Sell => balance,
+            // The largest buy whose sell leg, rounded down, fits the balance.
+            // `balance < sell_amount`, so the quotient fits u64.
+            Side::Buy => fits(
+                u128::from(self.buy_amount) * u128::from(balance) / u128::from(self.sell_amount),
+            ),
+        };
+        self.scaled(open)
+    }
+
+    /// The signed order-side target and the other leg.
+    fn legs(&self) -> (u64, u64) {
+        match self.side {
+            Side::Sell => (self.sell_amount, self.buy_amount),
+            Side::Buy => (self.buy_amount, self.sell_amount),
+        }
+    }
+
+    /// The legs for `open` of the order-side target, the other leg scaled in
+    /// proportion. Rounds like the EVM driver, the sell leg down and the buy
+    /// leg up, so the scaled limit is never looser than the signed one.
+    fn scaled(&self, open: u64) -> Remaining {
+        if open == 0 {
+            return Remaining { sell: 0, buy: 0 };
+        }
+        let (target, other) = self.legs();
+        let scaled = u128::from(other) * u128::from(open);
+        let target = u128::from(target);
+        // `open <= target`, so the quotient never exceeds `other`.
+        match self.side {
+            Side::Sell => Remaining {
+                sell: open,
+                buy: fits(scaled.div_ceil(target)),
+            },
+            Side::Buy => Remaining {
+                sell: fits(scaled / target),
+                buy: open,
+            },
+        }
+    }
+
     /// Whether `buy_token_account` is the owner's associated token account
     /// for the buy mint under the mint's token `program`, the only
     /// destination an idempotent create can produce.
@@ -180,6 +287,26 @@ impl Order {
     /// Program ID in place of a buy mint.
     pub fn buys_native_sol(&self) -> bool {
         self.buy_token == ENCODED_NATIVE_SOL_TRANSFER
+    }
+}
+
+/// Narrows a leg scaled from, and bounded by, `u64` amounts.
+fn fits(leg: u128) -> u64 {
+    u64::try_from(leg).expect("a scaled leg fits u64")
+}
+
+/// What is left of an order to fill, see [`Order::remaining`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Remaining {
+    pub sell: u64,
+    pub buy: u64,
+}
+
+impl Remaining {
+    /// Whether a leg scaled down to nothing. The program only accepts a fill
+    /// moving zero on that side, so no engine can fill the order.
+    pub fn has_zero_leg(self) -> bool {
+        self.sell == 0 || self.buy == 0
     }
 }
 
@@ -226,6 +353,8 @@ mod tests {
             partially_fillable: false,
             order_pda: pubkey(0x77),
             app_data: [0; 32],
+            executed: 0,
+            sell_balance: None,
         }
     }
 
@@ -235,6 +364,8 @@ mod tests {
             orders,
             deadline_slot: Slot(0),
             deadline: chrono::Utc::now(),
+            creations: HashMap::new(),
+            native_prices: HashMap::new(),
         }
     }
 
@@ -261,7 +392,15 @@ mod tests {
                 multiple_accounts_json(accounts),
             ),
         ]);
-        Solana::new(SolanaRPC::new_mock_with_mocks_map(mocks), pubkey(0xaa))
+        blockchain_with_mocks_map(mocks)
+    }
+
+    fn blockchain_with_mocks_map(mocks: MocksMap) -> Solana {
+        Solana::new(
+            SolanaRPC::new_mock_with_mocks_map(mocks.clone()),
+            SolanaRPC::new_mock_with_mocks_map(mocks),
+            pubkey(0xaa),
+        )
     }
 
     /// The buy mint is an SPL Token mint. The account lookup answers in
@@ -409,6 +548,200 @@ mod tests {
             )
             .await
             .expect_err("a failed lookup fails the resolution");
+    }
+
+    /// The lookup answers in order: the first order's PDA exists, the
+    /// second's does not.
+    #[tokio::test]
+    async fn drops_the_creations_whose_order_pda_exists() {
+        let existing = json!({
+            "lamports": 1u64,
+            "data": ["", "base64"],
+            "owner": pubkey(0xaa).to_string(),
+            "executable": false,
+            "rentEpoch": 0u64,
+            "space": 0u64,
+        });
+        let mocks = MocksMap::from_iter([(
+            RpcRequest::GetMultipleAccounts,
+            multiple_accounts_json([existing, Value::Null]),
+        )]);
+        let mut auction = auction(vec![
+            order(1, pubkey(0x66)),
+            Order {
+                order_pda: pubkey(0x78),
+                ..order(2, pubkey(0x66))
+            },
+        ]);
+        auction.creations = HashMap::from([
+            (OrderUid([1; 32]), VersionedTransaction::default()),
+            (OrderUid([2; 32]), VersionedTransaction::default()),
+        ]);
+
+        auction
+            .drop_landed_creations(&blockchain_with_mocks_map(mocks))
+            .await;
+
+        assert_eq!(
+            auction.creations.keys().collect::<Vec<_>>(),
+            [&OrderUid([2; 32])]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_lookup_keeps_every_creation() {
+        let mocks = MocksMap::from_iter([(
+            RpcRequest::GetMultipleAccounts,
+            json!("not an account list"),
+        )]);
+        let mut auction = auction(vec![order(1, pubkey(0x66))]);
+        auction.creations = HashMap::from([(OrderUid([1; 32]), VersionedTransaction::default())]);
+
+        auction
+            .drop_landed_creations(&blockchain_with_mocks_map(mocks))
+            .await;
+
+        assert_eq!(auction.creations.len(), 1);
+    }
+
+    #[test]
+    fn an_untouched_order_remains_whole() {
+        let order = order(1, pubkey(0x66));
+        assert_eq!(
+            order.remaining(),
+            Remaining {
+                sell: 1_000,
+                buy: 2_000
+            }
+        );
+    }
+
+    /// The sell balance caps a partially fillable order: 400 of 1000 sold
+    /// leaves 600 to sell, a balance of 300 halves both legs. For a buy
+    /// order the balance bounds the sell leg: 400 of 2000 bought leaves
+    /// 1600 to buy for 800, a balance of 333 allows 666 to buy for 333. A
+    /// balance covering the remainder, an unknown one, or a fill-or-kill
+    /// order leave the remainder alone.
+    #[test]
+    fn available_scales_the_remainder_down_to_the_sell_balance() {
+        let sell = Order {
+            partially_fillable: true,
+            executed: 400,
+            sell_balance: Some(300),
+            ..order(1, pubkey(0x66))
+        };
+        assert_eq!(
+            sell.remaining(),
+            Remaining {
+                sell: 600,
+                buy: 1_200
+            }
+        );
+        assert_eq!(
+            sell.available(),
+            Remaining {
+                sell: 300,
+                buy: 600
+            }
+        );
+        for unscaled in [
+            Order {
+                sell_balance: Some(600),
+                ..sell.clone()
+            },
+            Order {
+                sell_balance: None,
+                ..sell.clone()
+            },
+            Order {
+                partially_fillable: false,
+                ..sell.clone()
+            },
+        ] {
+            assert_eq!(unscaled.available(), sell.remaining(), "{unscaled:?}");
+        }
+        assert_eq!(
+            Order {
+                sell_balance: Some(0),
+                ..sell.clone()
+            }
+            .available(),
+            Remaining { sell: 0, buy: 0 }
+        );
+
+        let buy = Order {
+            side: Side::Buy,
+            sell_balance: Some(333),
+            ..sell
+        };
+        assert_eq!(
+            buy.remaining(),
+            Remaining {
+                sell: 800,
+                buy: 1_600
+            }
+        );
+        assert_eq!(
+            buy.available(),
+            Remaining {
+                sell: 333,
+                buy: 666
+            }
+        );
+    }
+
+    /// 999 of 1000 sold leaves 1 to sell; the 2000 buy limit scales to 2,
+    /// and a limit that does not divide evenly rounds up against the fill.
+    #[test]
+    fn a_partially_filled_sell_scales_the_buy_leg_up() {
+        let order = Order {
+            executed: 999,
+            ..order(1, pubkey(0x66))
+        };
+        assert_eq!(order.remaining(), Remaining { sell: 1, buy: 2 });
+        let order = Order {
+            buy_amount: 2_001,
+            ..order
+        };
+        assert_eq!(order.remaining(), Remaining { sell: 1, buy: 3 });
+    }
+
+    /// 1999 of 2000 bought leaves 1 to buy; the 1000 sell limit scales to
+    /// 0.5 and rounds down against the fill.
+    #[test]
+    fn a_partially_filled_buy_scales_the_sell_leg_down() {
+        let order = Order {
+            side: Side::Buy,
+            executed: 1_999,
+            ..order(1, pubkey(0x66))
+        };
+        assert_eq!(order.remaining(), Remaining { sell: 0, buy: 1 });
+        assert!(order.remaining().has_zero_leg());
+        assert!(
+            !Order {
+                executed: 1_998,
+                ..order
+            }
+            .remaining()
+            .has_zero_leg()
+        );
+    }
+
+    #[test]
+    fn remaining_amounts_survive_u64_products() {
+        let order = Order {
+            sell_amount: u64::MAX,
+            buy_amount: u64::MAX,
+            executed: 1,
+            ..order(1, pubkey(0x66))
+        };
+        assert_eq!(
+            order.remaining(),
+            Remaining {
+                sell: u64::MAX - 1,
+                buy: u64::MAX - 1
+            }
+        );
     }
 
     #[test]

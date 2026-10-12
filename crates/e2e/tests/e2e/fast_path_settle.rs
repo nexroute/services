@@ -312,10 +312,17 @@ async fn fast_path_settle(web3: Web3, side: OrderKind) {
     // reverted and the regular auction picked the order up instead.
     let trade = services.get_trades(&uid).await.unwrap().pop().unwrap();
     let tx_hash = trade.tx_hash.expect("settled trade has a transaction");
-    let settled_in = settled_competition(&services, tx_hash).await.auction_id;
+    let competition = settled_competition(&services, tx_hash).await;
     assert_eq!(
-        settled_in, fast_path_auction,
-        "order settled under auction {settled_in} but the fast path staged {fast_path_auction}",
+        competition.auction_id, fast_path_auction,
+        "order settled under auction {} but the fast path staged {fast_path_auction}",
+        competition.auction_id,
+    );
+    assert!(competition.fast_path, "expected a fast-path auction");
+    assert_eq!(
+        crate::database::fast_path_quote_id_of_auction(services.db(), fast_path_auction).await,
+        Some(quote_id),
+        "fast-path auction {fast_path_auction} should map to quote {quote_id}",
     );
 
     // Signed at the quote, and the fast path settles at exactly the
@@ -809,12 +816,21 @@ async fn fast_path_penalty_cap(web3: Web3) {
         "fast-path competition row should carry a positive penalty cap, got {caps:?}",
     );
 
-    // The settled trade exposes that same cap for accounting.
-    let trade = services.get_trades(&uid).await.unwrap().remove(0);
-    let cap = trade
-        .penalty_cap_native
-        .expect("settled fast-path trade carries the auction's penalty cap");
-    assert!(!cap.is_zero());
+    // The settled trade exposes that same cap for accounting. The autopilot
+    // links the trade to its auction after the order is already marked
+    // `Fulfilled`, so give it a moment to populate `penalty_cap_native`.
+    wait_for_condition(TIMEOUT, || async {
+        onchain.mint_block().await;
+        services
+            .get_trades(&uid)
+            .await
+            .ok()
+            .and_then(|trades| trades.into_iter().next())
+            .and_then(|trade| trade.penalty_cap_native)
+            .is_some_and(|cap| !cap.is_zero())
+    })
+    .await
+    .expect("settled fast-path trade carries the auction's penalty cap");
 }
 
 /// Regression test for the quoter/solver fast-path cache split.
