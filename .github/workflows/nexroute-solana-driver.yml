@@ -1,0 +1,135 @@
+name: Nexroute — solana-driver build (+ staging deploy)
+
+# Builds the CoW Solana driver image ghcr.io/nexroute/solana-driver.
+#
+# - push to main touching the driver → build sha-<sha> + dev-latest (no deploy).
+# - Actions → Run workflow → `ref` = ANY branch, tag or commit SHA in this repo
+#   → build sha-<resolved sha> + <ref with / → ->. Tick `deploy` to roll it to
+#   the staging driver (cowswap-staging-solana-driver on nexroute-api-partners-01)
+#   through nexroute-infra's reusable deploy.yml.
+#
+# The deploy overrides the inventory pin for that run only
+# (-e cowswap_solana_driver_version=sha-<sha>); the next infra deploy goes back
+# to nexroute-infra's pinned tag. Pin it there to keep a build.
+#
+# GitHub-hosted runner on purpose: this repo is public, and our self-hosted
+# builder must not run code from public-repo pull requests.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/solana-driver/**"
+      - "crates/cow-solana-*/**"
+      - "crates/solana-token/**"
+      - "crates/chain-types/**"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "nexroute/solana-driver.Dockerfile"
+      - ".github/workflows/nexroute-solana-driver.yml"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch, tag or commit SHA to build (empty = the branch you run from)"
+        required: false
+        default: ""
+      deploy:
+        description: "Deploy to the staging Solana driver (partners-01) after the build"
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: nexroute-solana-driver
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE: ghcr.io/nexroute/solana-driver
+
+jobs:
+  build:
+    name: Build image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write # push to ghcr.io/nexroute/solana-driver
+    outputs:
+      sha: ${{ steps.sha.outputs.sha }}
+      short_sha: ${{ steps.sha.outputs.short_sha }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          persist-credentials: false
+
+      - name: Resolve commit and tags
+        id: sha
+        env:
+          INPUT_REF: ${{ inputs.ref }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          SHA=$(git rev-parse HEAD)
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${SHA:0:7}" >> "$GITHUB_OUTPUT"
+          TAGS="${IMAGE}:sha-${SHA}"
+          if [ "$EVENT" = "push" ]; then
+            TAGS="${TAGS}"$'\n'"${IMAGE}:dev-latest"
+          elif [ -n "$INPUT_REF" ]; then
+            REF_TAG=$(printf '%s' "$INPUT_REF" | sed 's|/|-|g; s|[^A-Za-z0-9_.-]|-|g' | cut -c1-120)
+            TAGS="${TAGS}"$'\n'"${IMAGE}:${REF_TAG}"
+          fi
+          {
+            echo "tags<<EOF"
+            echo "$TAGS"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: nexroute/solana-driver.Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.sha.outputs.tags }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ steps.sha.outputs.sha }}
+          cache-from: type=gha,scope=solana-driver
+          cache-to: type=gha,scope=solana-driver,mode=max
+
+  deploy:
+    name: Deploy to staging (partners-01)
+    if: github.event_name == 'workflow_dispatch' && inputs.deploy
+    needs: [build]
+    permissions:
+      contents: read
+    uses: nexroute/nexroute-infra/.github/workflows/deploy.yml@main # zizmor: ignore[unpinned-uses] intentionally tracks the infra default branch, like every cross-repo caller
+    with:
+      playbook: start-nexroute-cowswap.yml
+      # The driver runs on partners-01 only (cowswap_solana_driver_hosts).
+      hosts: nexroute-api-partners-01
+      service_name: solana-driver (staging)
+      commit_sha: ${{ needs.build.outputs.sha }}
+      commit_message: "Deploy solana-driver ${{ needs.build.outputs.short_sha }} to staging"
+      repo: ${{ github.repository }}
+      extra_args: "-e cowswap_solana_driver_version=sha-${{ needs.build.outputs.sha }}"
+    secrets:
+      DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+      ANSIBLE_VAULT_PASSWORD: ${{ secrets.ANSIBLE_VAULT_PASSWORD }}
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
